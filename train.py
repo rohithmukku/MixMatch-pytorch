@@ -8,6 +8,8 @@ import random
 
 import numpy as np
 
+from PIL import Image
+
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -18,8 +20,9 @@ import torchvision.transforms as transforms
 import torch.nn.functional as F
 
 import models.wideresnet as models
-import dataset.cifar10 as dataset
-from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
+import dataset.dl_dataset as dataset
+# from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
+from utils import Logger, AverageMeter, accuracy, mkdir_p, savefig
 from tensorboardX import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
@@ -52,6 +55,8 @@ parser.add_argument('--lambda-u', default=75, type=float)
 parser.add_argument('--T', default=0.5, type=float)
 parser.add_argument('--ema-decay', default=0.999, type=float)
 
+parser.add_argument('--num-classes', default=800, type=int)
+
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -74,7 +79,7 @@ def main():
         mkdir_p(args.out)
 
     # Data
-    print(f'==> Preparing cifar10')
+    print(f'==> Preparing DL Dataset')
     transform_train = transforms.Compose([
         dataset.RandomPadandCrop(32),
         dataset.RandomFlip(),
@@ -85,17 +90,48 @@ def main():
         dataset.ToTensor(),
     ])
 
-    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10('./data', args.n_labeled, transform_train=transform_train, transform_val=transform_val)
-    labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
-    unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
-    val_loader = data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_loader = data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    # train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10('./data', args.n_labeled, transform_train=transform_train, transform_val=transform_val)
+    # labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
+    # unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
+    # val_loader = data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    # test_loader = data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    normalize = transforms.Normalize(mean=[0.4837, 0.4531, 0.4015],
+                                 std=[0.2212, 0.2165, 0.2156])
+
+    # Inverse transformation: needed for plotting.
+    unnormalize = transforms.Normalize(
+        mean=[-0.4837/0.2212, -0.4531/0.2165, -0.4015/0.2156],
+        std=[1/0.2212, 1/0.2165, 1/0.2156]
+    )
+
+    train_transforms = transforms.Compose([
+                                            transforms.Resize((32, 32)),
+                                            transforms.RandomHorizontalFlip(),
+                                            transforms.RandomVerticalFlip(),
+                                            transforms.ColorJitter(hue=.1, saturation=.1, contrast=.1),
+                                            transforms.RandomRotation(20, resample=Image.BILINEAR),
+                                            transforms.GaussianBlur(7, sigma=(0.1, 1.0)),
+                                            transforms.ToTensor(), 
+                                            normalize,
+                                        ])
+    
+    val_transforms = transforms.Compose([
+                                        transforms.Resize((32, 32)),
+                                        transforms.ToTensor(), 
+                                        normalize,
+                                        ])
+
+    train_dataset, unlabeled_dataset, val_dataset = dataset.get_dl_dataset(transform_train=train_transforms, transform_val=val_transforms)
+    # train_dataset = CustomDataset(root="dataset", split="unlabeled", transform=unlabeled_transforms)
+    labeled_trainloader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    unlabeled_trainloader = data.DataLoader(unlabeled_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Model
     print("==> creating WRN-28-2")
 
     def create_model(ema=False):
-        model = models.WideResNet(num_classes=10)
+        model = models.WideResNet(num_classes=args.num_classes)
         model = model.cuda()
 
         if ema:
@@ -118,7 +154,8 @@ def main():
     start_epoch = 0
 
     # Resume
-    title = 'noisy-cifar-10'
+    # title = 'noisy-cifar-10'
+    title = 'dldataset-800'
     if args.resume:
         # Load checkpoint.
         print('==> Resuming from checkpoint..')
@@ -133,7 +170,7 @@ def main():
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
     else:
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
-        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U',  'Valid Loss', 'Valid Acc.', 'Test Loss', 'Test Acc.'])
+        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U',  'Valid Loss', 'Valid Acc.'])#, 'Test Loss', 'Test Acc.'])
 
     writer = SummaryWriter(args.out)
     step = 0
@@ -146,20 +183,20 @@ def main():
         train_loss, train_loss_x, train_loss_u = train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion, epoch, use_cuda)
         _, train_acc = validate(labeled_trainloader, ema_model, criterion, epoch, use_cuda, mode='Train Stats')
         val_loss, val_acc = validate(val_loader, ema_model, criterion, epoch, use_cuda, mode='Valid Stats')
-        test_loss, test_acc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats ')
+        # test_loss, test_acc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats ')
 
         step = args.train_iteration * (epoch + 1)
 
         writer.add_scalar('losses/train_loss', train_loss, step)
         writer.add_scalar('losses/valid_loss', val_loss, step)
-        writer.add_scalar('losses/test_loss', test_loss, step)
+        # writer.add_scalar('losses/test_loss', test_loss, step)
 
         writer.add_scalar('accuracy/train_acc', train_acc, step)
         writer.add_scalar('accuracy/val_acc', val_acc, step)
-        writer.add_scalar('accuracy/test_acc', test_acc, step)
+        # writer.add_scalar('accuracy/test_acc', test_acc, step)
 
         # append logger file
-        logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc, test_loss, test_acc])
+        logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc])#, test_loss, test_acc])
 
         # save model
         is_best = val_acc > best_acc
@@ -172,15 +209,15 @@ def main():
                 'best_acc': best_acc,
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
-        test_accs.append(test_acc)
+        # test_accs.append(test_acc)
     logger.close()
     writer.close()
 
     print('Best acc:')
     print(best_acc)
 
-    print('Mean acc:')
-    print(np.mean(test_accs[-20:]))
+    # print('Mean acc:')
+    # print(np.mean(test_accs[-20:]))
 
 
 def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, criterion, epoch, use_cuda):
@@ -193,7 +230,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     ws = AverageMeter()
     end = time.time()
 
-    bar = Bar('Training', max=args.train_iteration)
+    # bar = Bar('Training', max=args.train_iteration)
     labeled_train_iter = iter(labeled_trainloader)
     unlabeled_train_iter = iter(unlabeled_trainloader)
 
@@ -217,7 +254,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         batch_size = inputs_x.size(0)
 
         # Transform label to one-hot
-        targets_x = torch.zeros(batch_size, 10).scatter_(1, targets_x.view(-1,1).long(), 1)
+        targets_x = torch.zeros(batch_size, args.num_classes).scatter_(1, targets_x.view(-1,1).long(), 1)
 
         if use_cuda:
             inputs_x, targets_x = inputs_x.cuda(), targets_x.cuda(non_blocking=True)
@@ -284,20 +321,20 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         end = time.time()
 
         # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | W: {w:.4f}'.format(
-                    batch=batch_idx + 1,
-                    size=args.train_iteration,
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    total=bar.elapsed_td,
-                    eta=bar.eta_td,
-                    loss=losses.avg,
-                    loss_x=losses_x.avg,
-                    loss_u=losses_u.avg,
-                    w=ws.avg,
-                    )
-        bar.next()
-    bar.finish()
+        # bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | W: {w:.4f}'.format(
+        #             batch=batch_idx + 1,
+        #             size=args.train_iteration,
+        #             data=data_time.avg,
+        #             bt=batch_time.avg,
+        #             total=bar.elapsed_td,
+        #             eta=bar.eta_td,
+        #             loss=losses.avg,
+        #             loss_x=losses_x.avg,
+        #             loss_u=losses_u.avg,
+        #             w=ws.avg,
+        #             )
+        # bar.next()
+    # bar.finish()
 
     return (losses.avg, losses_x.avg, losses_u.avg,)
 
@@ -313,7 +350,7 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
     model.eval()
 
     end = time.time()
-    bar = Bar(f'{mode}', max=len(valloader))
+    # bar = Bar(f'{mode}', max=len(valloader))
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(valloader):
             # measure data loading time
@@ -336,19 +373,19 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
             end = time.time()
 
             # plot progress
-            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-                        batch=batch_idx + 1,
-                        size=len(valloader),
-                        data=data_time.avg,
-                        bt=batch_time.avg,
-                        total=bar.elapsed_td,
-                        eta=bar.eta_td,
-                        loss=losses.avg,
-                        top1=top1.avg,
-                        top5=top5.avg,
-                        )
-            bar.next()
-        bar.finish()
+            # bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+            #             batch=batch_idx + 1,
+            #             size=len(valloader),
+            #             data=data_time.avg,
+            #             bt=batch_time.avg,
+            #             total=bar.elapsed_td,
+            #             eta=bar.eta_td,
+            #             loss=losses.avg,
+            #             top1=top1.avg,
+            #             top5=top5.avg,
+            #             )
+            # bar.next()
+        # bar.finish()
     return (losses.avg, top1.avg)
 
 def save_checkpoint(state, is_best, checkpoint=args.out, filename='checkpoint.pth.tar'):
